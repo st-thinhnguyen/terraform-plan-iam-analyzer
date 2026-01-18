@@ -6,17 +6,23 @@ A Python tool that analyzes Terraform plan files and automatically generates the
 
 - **Automatic Permission Discovery**: Analyzes Terraform plan JSON files to extract resource changes and fetch required IAM permissions
 - **Smart Service Mapping**: Maps Terraform resource types to correct AWS service APIs with extensive built-in mappings
+- **Permission Normalization**: Uses `map.json` (19,000+ SDK method mappings) to normalize and correct permission names
+- **Permission Expansion**: Automatically adds related permissions (e.g., `kms:CreateKey` → `kms:CreateKey` + `kms:TagResource`)
 - **Multi-Action Support**: Handles create, update, delete, and read operations
-- **ARN Resolution**: Automatically fetches and resolves resource ARN patterns for each permission
-- **Metadata Extraction**: Extracts region, account ID, and partition from Terraform plan for accurate ARN generation
+- **ARN Resolution**: Fetches ARN patterns from IAM Explorer API with fallback to map.json for missing permissions
+- **Metadata Extraction**: Extracts region and partition from Terraform plan, keeps `${Account}` as placeholder
+- **Error Tracking**: Comprehensive error logging to `error.json` with detailed API failure information
+- **Policy Optimization**: Deduplicates permissions and groups by resource ARN, places wildcard resources first
+- **Policy Splitting**: Includes `iam-split.py` tool to split large policies into AWS-compliant 6KB chunks
 - **Ready-to-Use IAM Policies**: Generates properly formatted IAM policy documents with grouped permissions
-- **Intelligent Grouping**: Groups permissions by service and resource ARNs for optimal policy structure
 
 ## Prerequisites
 
 - Python 3.7+
 - `requests` library
 - Internet connectivity (to fetch permission data from APIs)
+- `map.json` - SDK method to IAM permission mappings (19,010+ entries)
+- `resources.json` - Valid IAM service names (231 services)
 
 ## Installation
 
@@ -87,11 +93,14 @@ python main.py my-plan.json results.json policy.json
 ## How It Works
 
 1. **Plan Analysis**: Parses the Terraform plan JSON to identify resource changes (create, update, delete)
-2. **Metadata Extraction**: Extracts AWS account ID, region, and partition from ARNs in the plan
+2. **AWS Context Extraction**: Extracts region from plan variables, sets partition to 'aws', keeps `${Account}` as placeholder
 3. **Service Mapping**: Maps Terraform resource types to AWS IAM service names using comprehensive built-in mappings
-4. **Permission Fetching**: Retrieves required IAM permissions for each resource type and action from the TFGrantless API
-5. **ARN Resolution**: Fetches resource ARN patterns for each permission from the IAM Explorer API
-6. **Policy Generation**: Groups permissions by service and resource ARNs, then generates a properly formatted IAM policy document
+4. **Permission Fetching**: Retrieves required IAM permissions from TFGrantless API (with fallback logic)
+5. **Permission Normalization**: Normalizes permission names using map.json SDK mappings (e.g., `cognito-identity` → `cognito-idp`)
+6. **Permission Expansion**: Adds related permissions from map.json (e.g., `CreateKey` → `CreateKey` + `TagResource`)
+7. **ARN Resolution**: Fetches ARN patterns from IAM Explorer API, with fallback to map.json for missing permissions
+8. **Policy Generation**: Deduplicates permissions, groups by resource ARN, places wildcard resources first
+9. **Error Logging**: Writes all API failures and issues to `error.json` for troubleshooting
 
 ## Input Format
 
@@ -110,7 +119,7 @@ Contains detailed analysis of each resource type with:
 - `type`: Terraform resource type
 - `service`: AWS IAM service name
 - `actions`: Terraform actions (create, update, delete, read)
-- `permissions`: Required IAM permissions for the specified actions
+- `permissions`: Required IAM permissions (normalized and expanded)
 
 Example:
 ```json
@@ -139,9 +148,17 @@ AWS IAM policy document ready to use with automatically resolved resource ARNs:
     {
       "Effect": "Allow",
       "Action": [
+        "iam:ListPolicies",
+        "iam:ListRoles"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Effect": "Allow",
+      "Action": [
         "s3:CreateBucket",
-        "s3:GetBucketAcl",
-        "s3:PutBucketPolicy"
+        "s3:DeleteBucket",
+        "s3:GetBucketAcl"
       ],
       "Resource": "arn:aws:s3:::${BucketName}"
     }
@@ -150,10 +167,58 @@ AWS IAM policy document ready to use with automatically resolved resource ARNs:
 ```
 
 **Key Features:**
-- Permissions are grouped by service and resource ARN patterns
-- Wildcard (`*`) resources are placed in separate statements
-- ARN placeholders (`${Partition}`, `${Region}`, `${Account}`) are automatically replaced with actual values from the Terraform plan
+- Wildcard (`*`) resource statements are placed at the top
+- Permissions are deduplicated and grouped by resource ARN patterns
+- ARN placeholders: `${Partition}` → `aws`, `${Region}` → `ap-northeast-1`, `${Account}` kept as placeholder
 - Remaining placeholders (e.g., `${BucketName}`) require manual updates based on your specific resource names
+
+### `error.json`
+
+Comprehensive error tracking for troubleshooting API issues:
+
+```json
+{
+  "total_errors": 15,
+  "errors": [
+    {
+      "step": "fetch_arn",
+      "permission": "cognito-idp:CreateUserPool",
+      "url": "https://iam-explorer.skillsboost.cloud/json/cognito-idp/CreateUserPool.json",
+      "error": "Expecting value: line 1 column 1 (char 0)"
+    }
+  ]
+}
+```
+
+Contains:
+- `step`: Which operation failed (fetch_permissions, fetch_arn)
+- `resource` or `permission`: What was being processed
+- `url`: The API endpoint that failed
+- `error`: Error message details
+
+## Splitting Large Policies
+
+AWS IAM policies have a maximum size limit of 6,144 characters. Use `iam-split.py` to split large policies:
+
+```bash
+# Default: reads iam.json, outputs to iam-policies/ folder
+python3 iam-split.py
+
+# Custom input/output:
+python3 iam-split.py input.json output-folder/
+```
+
+This creates multiple policy files (`iam1.json`, `iam2.json`, etc.) that each stay under the 6KB limit while maximizing the number of statements per file.
+
+Example output:
+```
+Info: Created 'iam-policies/iam1.json' with 45 statements (6120 chars)
+Info: Created 'iam-policies/iam2.json' with 38 statements (5890 chars)
+
+Success: Split policy into 2 files in 'iam-policies'
+Total statements: 83
+Total size: 12010 characters
+```
 
 ## Service Mappings
 
@@ -187,11 +252,12 @@ The tool automatically handles AWS service mappings for Terraform resources. Her
 |-------------------|-------------|-------|
 | `aws_cloudwatch_log_group` | `logs` | CloudWatch Logs |
 | `aws_cloudtrail` | `cloudtrail` | CloudTrail trails |
-| `aws_cognito_user_pool` | `cognito-identity` | Cognito User Pools |
+| `aws_cognito_user_pool` | `cognitoidp` | Cognito User Pools (auto-normalized from cognito-identity) |
 | `aws_iam_*` | `iam` | IAM resources |
 
-### Non-AWS Resources
-The tool automatically skips non-AWS resources:
+### Filtered Resources
+The tool automatically filters out unsupported resources:
+- `s3express:*` - S3 Express permissions (not yet in IAM Explorer)
 - `local_*` - Local provider resources
 - `random_*` - Random provider resources
 - `tls_*` - TLS provider resources
@@ -200,36 +266,57 @@ The tool automatically skips non-AWS resources:
 
 Some resources have different names in the API compared to Terraform:
 
-| Terraform Resource | API Resource Name |
-|-------------------|-------------------|
-| `aws_cloudtrail` | `aws_cloudtrail_trail` |
-| `aws_lb` | `aws_elasticloadbalancing_load_balancer` |
-| `aws_lb_listener` | `aws_elasticloadbalancing_listener` |
-| `aws_lb_target_group` | `aws_elasticloadbalancing_target_group` |
-| `aws_flow_log` | `aws_ec2_log_flow` |
-| `aws_db_parameter_group` | `aws_rds_cluster_parameter_group` |
-| `aws_db_subnet_group` | `aws_rds_subnet_group` |
-| `aws_cognito_user_pool` | `aws_cognitoidp_user_pool` |
-| `aws_cognito_user_pool_domain` | `aws_cognitoidp_user_pool_domain` |
-| `aws_iam_openid_connect_provider` | `aws_iam_open_id_connect_provider` |
+| Terraform Resource | API Resource Name | Notes |
+|-------------------|-------------------|-------|
+| `aws_cloudtrail` | `aws_cloudtrail_trail` | |
+| `aws_cognito_user_pool` | `aws_cognito_user_pool` | Uses cognitoidp service |
+| `aws_cognito_user_pool_client` | `aws_cognito_user_pool_client` | Uses cognitoidp service |
+| `aws_cognito_user_pool_domain` | `aws_cognito_user_pool_domain` | Uses cognitoidp service |
+| `aws_db_parameter_group` | `aws_rds_cluster_parameter_group` | |
+| `aws_db_subnet_group` | `aws_db_subnet_group` | Fixed from aws_rds_subnet_group |
+| `aws_flow_log` | `aws_ec2_log_flow` | Special handling with hardcoded permissions |
+| `aws_iam_openid_connect_provider` | `aws_iam_open_id_connect_provider` | |
+| `aws_lb` | `aws_lb` | Uses elbv2 service |
+| `aws_lb_listener` | `aws_lb_listener` | Uses elbv2 service |
+| `aws_lb_target_group` | `aws_lb_target_group` | Uses elbv2 service |
+| `aws_sqs_queue_policy` | N/A | Hardcoded to sqs:SetQueueAttributes |
 
-## API Endpoints
+## Data Sources
 
-The tool fetches data from two APIs:
+The tool uses multiple data sources for accurate permission generation:
 
-1. **TFGrantless API** - For resource permissions:
-   ```
-   https://tfgrantless.skillsboost.cloud/assets/{service}/{resource_type}-resource-permissions.json
-   ```
+### 1. TFGrantless API
+Fetches Terraform resource permissions:
+```
+https://tfgrantless.skillsboost.cloud/assets/{service}/{resource_type}-{type}-permissions.json
+```
+- Returns nested structure with action categories (create, delete, put, read, update)
+- Automatically flattened to extract all permissions
 
-2. **IAM Explorer API** - For resource ARN patterns:
-   ```
-   https://iam-explorer.skillsboost.cloud/json/{service}/{action}.json
-   ```
+### 2. IAM Explorer API
+Fetches ARN patterns for permissions:
+```
+https://iam-explorer.skillsboost.cloud/json/{service}/{action}.json
+```
+- Returns `{"access_level": "...", "resource_arns": [...]}`
+- Service name mappings: `elbv2` → `elasticloadbalancing`, `cognitoidp` → `cognito-idp`, `appautoscaling` → `application-autoscaling`
+- Special handling: `iam:PassRole` and `iam:CreateServiceLinkedRole` always use `iam` service
 
-## Resources Validation
+### 3. map.json (Local)
+SDK method to IAM permission mappings (19,010+ entries):
+- **Permission Normalization**: Corrects permission names (e.g., `cognito-identity` → `cognito-idp`)
+- **Permission Expansion**: Adds related permissions (e.g., `KMS.CreateKey` → `[kms:CreateKey, kms:TagResource]`)
+- **ARN Fallback**: Extracts ARN patterns when IAM Explorer doesn't have data
+- Example entry:
+  ```json
+  "KMS.CreateKey": [
+    {"action": "kms:CreateKey"},
+    {"action": "kms:TagResource", "arn_override": {"template": "arn:${Partition}:kms:${Region}:${Account}:key/${KeyId}"}}
+  ]
+  ```
 
-The tool uses a `resources.json` file that contains a list of valid IAM service names. This helps validate service mappings and ensures accuracy when fetching permissions.
+### 4. resources.json (Local)
+List of 231 valid IAM service names for validation
 
 ## Error Handling
 
@@ -253,28 +340,43 @@ All warnings and errors are written to `stderr`, while the main output goes to t
 
 2. **Run the analyzer**:
    ```bash
-   python main.py
+   python3 main.py
    ```
    
-   Output shows extracted metadata:
+   Output shows processing information:
    ```
-   Extracted metadata:
-     Region: us-east-1
-     Account ID: 123456789012
-     Partition: aws
-   Results written to output.json
-   IAM policy written to iam.json
+   Info: Loaded 231 IAM services from resources.json
+   Info: Loaded 19010 SDK mappings from map.json
+   Step 1: Analyzing Terraform plan...
+   Info: Processing 47 resource changes
+   Info: AWS Region: ap-northeast-1
+   Info: Extracted 47 valid resources
+   
+   Step 2: Fetching permissions from TFGrantless API...
+   Info: Normalized 'cognito-identity:CreateUserPool' -> 'cognito-idp:CreateUserPool'
+   Info: Expanded 'kms:CreateKey' to include 'kms:TagResource' (from SDK mapping)
+   
+   Step 3: Generating IAM policy...
+   Info: Generated IAM policy with 83 statements (12 wildcard, 71 specific)
    ```
 
 3. **Review the generated files**:
    - Check `output.json` for detailed permission analysis
    - Review `iam.json` for the generated IAM policy
+   - Check `error.json` for any API failures (if exists)
 
-4. **Update resource-specific placeholders**:
+4. **Split large policies** (if needed):
+   ```bash
+   python3 iam-split.py
+   ```
+   Creates `iam-policies/iam1.json`, `iam-policies/iam2.json`, etc.
+
+5. **Update resource-specific placeholders**:
    - Replace placeholders like `${BucketName}`, `${RoleName}`, etc. with actual resource names
-   - Note that `${Partition}`, `${Region}`, and `${Account}` are already replaced
+   - Note that `${Partition}` and `${Region}` are already replaced
+   - `${Account}` is kept as placeholder for flexibility
 
-5. **Apply the IAM policy**:
+6. **Apply the IAM policy**:
    - Use the policy in your AWS IAM roles or users
    - Attach to CI/CD pipeline execution roles
    - Create least-privilege policies for Terraform automation
@@ -314,26 +416,63 @@ special_mappings = {
 
 ## Troubleshooting
 
+### Check error.json First
+
+Always check `error.json` after running the analyzer. It contains detailed information about API failures:
+
+```json
+{
+  "total_errors": 15,
+  "errors": [
+    {
+      "step": "fetch_arn",
+      "permission": "cognito-idp:CreateUserPool",
+      "url": "https://iam-explorer.skillsboost.cloud/json/cognito-idp/CreateUserPool.json",
+      "error": "Expecting value: line 1 column 1 (char 0)"
+    }
+  ]
+}
+```
+
 ### Missing Permissions
 
 If permissions are missing for a resource:
-1. Check if the resource type is correctly mapped to an AWS service
-2. Verify the resource exists in the TFGrantless API
-3. Check stderr output for API errors or warnings
+1. Check `error.json` for API errors
+2. Verify the resource type is correctly mapped to an AWS service
+3. Check if permission normalization is working (look for "Info: Normalized" in stderr)
+4. Verify the resource exists in the TFGrantless API
+5. For missing IAM Explorer data, check if map.json has the permission (ARN fallback)
+
+### Cognito Permissions Wrong Service
+
+If seeing `cognito-identity` instead of `cognito-idp`:
+1. Check that map.json is loaded (should see "Info: Loaded 19010 SDK mappings")
+2. Verify normalization is happening (check stderr for "Info: Normalized" messages)
+3. The tool auto-fixes: `cognito-identity:CreateUserPool` → `cognito-idp:CreateUserPool`
 
 ### ARN Placeholders Not Replaced
 
-If ARN placeholders like `${Account}` aren't replaced:
-1. Ensure your Terraform plan includes resources with ARNs
-2. Check that the Terraform plan has proper account/region information
-3. Verify that ARNs are present in the resource `after` values
+Only `${Partition}` and `${Region}` are auto-replaced:
+- `${Partition}` → `aws`
+- `${Region}` → extracted from plan.json variables (e.g., `ap-northeast-1`)
+- `${Account}` → kept as placeholder for flexibility
+- Other placeholders (e.g., `${BucketName}`) → require manual updates
 
 ### Empty IAM Policy
 
 If the generated IAM policy is empty:
 1. Verify the Terraform plan contains resource changes (not just no-ops)
-2. Check that the resources are AWS resources (not local/random/tls)
-3. Review stderr output for API fetch errors
+2. Check that the resources are AWS resources (not local/random/tls/s3express)
+3. Review `error.json` for API fetch errors
+4. Check stderr output for "Info: Generated IAM policy with X statements"
+
+### Policy Too Large
+
+If the policy exceeds 6KB:
+```bash
+python3 iam-split.py
+```
+This creates multiple compliant policy files in `iam-policies/` folder.
 
 ## Contributing
 
