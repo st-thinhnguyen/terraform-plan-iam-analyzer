@@ -1,2 +1,5 @@
-*.json
+iam*
+error*
+output*
+plan*
 venv

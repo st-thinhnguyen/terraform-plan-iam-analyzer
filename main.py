@@ -5,499 +5,682 @@ from collections import defaultdict
 from typing import List, Dict, Any, Set
 import requests
 
+# Global error collector
+ERRORS = []
+
 
 # Load valid IAM services from resources.json
 def load_iam_services() -> Set[str]:
     """Load the list of valid IAM service names from resources.json."""
     try:
-        resources_file = os.path.join(os.path.dirname(__file__), 'resources.json')
-        with open(resources_file, 'r') as f:
-            return set(json.load(f))
-    except (FileNotFoundError, json.JSONDecodeError):
-        print("Warning: Could not load resources.json, using default mappings", file=sys.stderr)
-        return set()
+        with open(os.path.join(os.path.dirname(__file__), 'resources.json')) as f:
+            data = json.load(f)
+            print(f"Info: Loaded {len(data)} IAM services from resources.json", file=sys.stderr)
+            return set(data)
+    except FileNotFoundError:
+        print("Warning: resources.json not found, validation disabled", file=sys.stderr)
+    except json.JSONDecodeError as e:
+        print(f"Warning: Invalid JSON in resources.json: {e.msg}", file=sys.stderr)
+    return set()
+
+
+def load_sdk_permission_mappings() -> Dict[str, List[Dict[str, Any]]]:
+    """Load SDK method to IAM permission mappings from map.json."""
+    try:
+        with open(os.path.join(os.path.dirname(__file__), 'map.json')) as f:
+            sdk_mappings = json.load(f).get('sdk_method_iam_mappings', {})
+            print(f"Info: Loaded {len(sdk_mappings)} SDK mappings from map.json", file=sys.stderr)
+            return sdk_mappings
+    except (FileNotFoundError, json.JSONDecodeError) as e:
+        print(f"Warning: Cannot load map.json: {e}", file=sys.stderr)
+    return {}
 
 
 IAM_SERVICES = load_iam_services()
+SDK_PERMISSION_MAPPINGS = load_sdk_permission_mappings()
+
+
+# ============================================================================
+# MAPPING TABLES - Update these when you have new mappings
+# ============================================================================
+
+# Terraform resource prefix to IAM service name mappings
+# Used when Terraform resource prefix differs from the IAM service name
+TERRAFORM_TO_IAM_SERVICE_MAPPINGS = {
+    # EC2 and Networking - All use 'ec2' service in IAM
+    'vpc': 'ec2',              # aws_vpc
+    'subnet': 'ec2',           # aws_subnet
+    'internet': 'ec2',         # aws_internet_gateway
+    'nat': 'ec2',              # aws_nat_gateway
+    'route': 'ec2',            # aws_route, aws_route_table
+    'security': 'ec2',         # aws_security_group
+    'eip': 'ec2',              # aws_eip (Elastic IP)
+    'instance': 'ec2',         # aws_instance
+    'key': 'ec2',              # aws_key_pair
+    'flow': 'ec2',             # aws_flow_log
+    'default': 'ec2',          # aws_default_*
+    'network': 'ec2',          # aws_network_*
+    'volume': 'ec2',           # aws_ebs_volume
+    'snapshot': 'ec2',         # aws_ebs_snapshot
+    'ami': 'ec2',              # aws_ami
+    
+    # Load Balancing - All use 'elbv2' service in IAM
+    'lb': 'elbv2',   # aws_lb (ALB/NLB)
+    'alb': 'elbv2',  # aws_alb (deprecated, use aws_lb)
+    'nlb': 'elbv2',  # aws_nlb
+    'elb': 'elasticloadbalancing',  # aws_elb (Classic LB)
+    
+    # Database - RDS service
+    'db': 'rds',               # aws_db_* resources
+    
+    # Logging and Monitoring
+    'cloudwatch': 'logs',      # aws_cloudwatch_log_group uses 'logs' service
+    
+    # Identity and Access
+    'cognito': 'cognitoidp',  # aws_cognito_* (user pools use cognitoidp)
+    
+    # Non-AWS resources (local providers - skip API calls)
+    'local': 'local',          # local_* resources
+    'random': 'random',        # random_* resources
+    'tls': 'tls',              # tls_* resources
+}
+
+# Terraform resource name to TFGrantless API resource name mappings
+# Used when the API resource name differs from Terraform resource name
+TERRAFORM_TO_API_RESOURCE_NAME_MAPPINGS = {
+    'aws_cloudtrail': 'aws_cloudtrail_trail',
+    'aws_cognito_user_pool': 'aws_cognito_user_pool',  # Fixed: remove 'idp' prefix
+    'aws_cognito_user_pool_client': 'aws_cognito_user_pool_client',  # Added
+    'aws_cognito_user_pool_domain': 'aws_cognito_user_pool_domain',  # Fixed: remove 'idp' prefix
+    'aws_db_parameter_group': 'aws_rds_cluster_parameter_group',
+    'aws_db_subnet_group': 'aws_db_subnet_group',  # Fixed: use correct name
+    'aws_flow_log': 'aws_ec2_log_flow',
+    'aws_iam_openid_connect_provider': 'aws_iam_open_id_connect_provider',
+    'aws_lb': 'aws_lb',  # Fixed: elbv2 service uses aws_lb
+    'aws_lb_listener': 'aws_lb_listener',  # Fixed: elbv2 service uses aws_lb_listener
+    'aws_lb_target_group': 'aws_lb_target_group',  # Fixed: elbv2 service uses aws_lb_target_group
+}
+
+# ============================================================================
+# END OF MAPPING TABLES
+# ============================================================================
+
+
+def normalize_iam_permission(permission: str) -> str:
+    """Normalize IAM permission name using map.json SDK mappings."""
+    if not SDK_PERMISSION_MAPPINGS or ':' not in permission:
+        return permission
+    
+    service_prefix, action = permission.split(':', 1)
+    
+    # Build list of SDK service name patterns to try
+    patterns = [
+        service_prefix.upper(),
+        service_prefix.title(),
+        ''.join(w.capitalize() for w in service_prefix.split('-'))
+    ]
+    
+    # Special case for cognito-identity -> try CognitoIdentityServiceProvider
+    if service_prefix == 'cognito-identity':
+        patterns.extend(['CognitoIdentityServiceProvider', 'CognitoIdentityProvider'])
+    
+    # Try each pattern
+    for pattern in patterns:
+        mappings = SDK_PERMISSION_MAPPINGS.get(f"{pattern}.{action}")
+        if mappings and mappings[0].get('action'):
+            normalized = mappings[0]['action']
+            if normalized != permission:
+                print(f"Info: Normalized '{permission}' -> '{normalized}'", file=sys.stderr)
+            return normalized
+    
+    return permission
+
+
+def expand_permissions_from_map(permissions: List[str]) -> List[str]:
+    """Expand permissions using map.json to include all related IAM actions.
+    
+    The map.json uses SDK method names (e.g., KMS.CreateKey) but we receive
+    IAM permission names (e.g., kms:CreateKey). We need to check if the
+    SDK method has additional permissions required.
+    
+    Example: KMS.CreateKey requires both kms:CreateKey and kms:TagResource
+    """
+    if not SDK_PERMISSION_MAPPINGS:
+        return permissions
+    
+    expanded = []
+    seen = set()
+    
+    for permission in permissions:
+        if ':' not in permission:
+            if permission not in seen:
+                expanded.append(permission)
+                seen.add(permission)
+            continue
+        
+        service_prefix, action = permission.split(':', 1)
+        
+        # Convert IAM permission to SDK method format
+        # kms:CreateKey -> KMS.CreateKey
+        # s3:GetObject -> S3.GetObject
+        sdk_service_patterns = [
+            service_prefix.upper(),  # kms -> KMS
+            service_prefix.title(),  # s3 -> S3
+            ''.join(w.capitalize() for w in service_prefix.split('-'))  # cognito-identity -> CognitoIdentity
+        ]
+        
+        found_mapping = False
+        for pattern in sdk_service_patterns:
+            sdk_key = f"{pattern}.{action}"
+            mappings = SDK_PERMISSION_MAPPINGS.get(sdk_key)
+            
+            if mappings and isinstance(mappings, list):
+                found_mapping = True
+                # Add all actions from the mapping
+                for mapping in mappings:
+                    if isinstance(mapping, dict):
+                        action_name = mapping.get('action')
+                        if action_name and action_name not in seen:
+                            expanded.append(action_name)
+                            seen.add(action_name)
+                            if len(mappings) > 1 and action_name != permission:
+                                print(f"Info: Expanded '{permission}' to include '{action_name}' (from SDK mapping)", file=sys.stderr)
+                break
+        
+        # If no mapping found, just add the original permission
+        if not found_mapping and permission not in seen:
+            expanded.append(permission)
+            seen.add(permission)
+    
+    return expanded
 
 
 def get_service_from_resource_type(resource_type: str) -> str:
-    """Map Terraform resource type to IAM service name.
+    """Extract IAM service name from Terraform resource type."""
+    if not resource_type.startswith('aws_'):
+        print(f"Warning: Non-AWS resource type '{resource_type}', skipping", file=sys.stderr)
+        return ''
     
-    Prioritizes Terraform naming, then checks against resources.json for validation.
-    """
-    # Custom mappings where Terraform name differs from IAM Explorer service name
-    # These are based on actual Terraform provider conventions
-    terraform_to_iam_mappings = {
-        # VPC and networking resources use EC2 in both Terraform and IAM
-        'vpc': 'ec2',
-        'subnet': 'ec2',
-        'internet': 'ec2',  # aws_internet_gateway
-        'nat': 'ec2',  # aws_nat_gateway
-        'route': 'ec2',  # aws_route, aws_route_table
-        'security': 'ec2',  # aws_security_group
-        'eip': 'ec2',  # aws_eip
-        'instance': 'ec2',  # aws_instance
-        'key': 'ec2',  # aws_key_pair
-        'flow': 'ec2',  # aws_flow_log
-        'default': 'ec2',  # aws_default_*
-        
-        # Load balancer - Terraform uses 'lb', IAM uses 'elasticloadbalancing'
-        'lb': 'elasticloadbalancing',
-        'alb': 'elasticloadbalancing',
-        'nlb': 'elasticloadbalancing',
-        'elb': 'elasticloadbalancing',
-        
-        # Database resources
-        'db': 'rds',  # aws_db_* resources use RDS
-        
-        # CloudWatch - Terraform uses 'cloudwatch_log_group', IAM uses 'logs'
-        'cloudwatch': 'logs',
-        
-        # Cognito - need to check which one is in resources.json
-        'cognito': 'cognito-identity',  # or 'sso' for identity center
-        
-        # Non-AWS resources (skip API calls)
-        'local': 'local',
-        'random': 'random',
-        'tls': 'tls',
+    parts = resource_type[4:].split('_')
+    prefix = parts[0] if parts else ''
+    
+    # Check mapping table first
+    if prefix in TERRAFORM_TO_IAM_SERVICE_MAPPINGS:
+        mapped_service = TERRAFORM_TO_IAM_SERVICE_MAPPINGS[prefix]
+        if mapped_service in {'local', 'random', 'tls'}:
+            print(f"Warning: Local provider resource '{resource_type}', skipping", file=sys.stderr)
+            return ''
+        return mapped_service
+    
+    # Validate against IAM services
+    if IAM_SERVICES and prefix not in IAM_SERVICES:
+        print(f"Warning: Service '{prefix}' not in IAM services for '{resource_type}'", file=sys.stderr)
+    
+    return prefix
+
+
+def get_api_resource_name(resource_type: str) -> str:
+    """Get the API resource name for TFGrantless API."""
+    return TERRAFORM_TO_API_RESOURCE_NAME_MAPPINGS.get(resource_type, resource_type)
+
+
+def analyze_terraform_plan(plan_file: str) -> List[Dict[str, Any]]:
+    """Parse Terraform plan and extract resource information."""
+    try:
+        with open(plan_file) as f:
+            plan = json.load(f)
+    except FileNotFoundError:
+        print(f"Error: Plan file '{plan_file}' not found", file=sys.stderr)
+        return []
+    except json.JSONDecodeError as e:
+        print(f"Error: Invalid JSON in '{plan_file}': {e.msg}", file=sys.stderr)
+        return []
+    
+    # Extract AWS context from plan
+    aws_context = {
+        'region': plan.get('variables', {}).get('region', {}).get('value', '*'),
+        'account': '${Account}',  # Keep as placeholder
+        'partition': 'aws'  # Default AWS partition
     }
     
-    parts = resource_type.split('_')
-    if len(parts) < 2:
-        return parts[0]
+    resources = []
+    resource_changes = plan.get('resource_changes', [])
     
-    # Handle non-AWS resources
-    if parts[0] in ['local', 'random', 'tls']:
-        return parts[0]
+    if not resource_changes:
+        print("Warning: No resource_changes found in plan", file=sys.stderr)
+        return []
     
-    # Remove 'aws' or 'data' prefix to get the Terraform service name
-    terraform_service = parts[1] if parts[0] in ['aws', 'data'] else parts[0]
+    print(f"Info: Processing {len(resource_changes)} resource changes", file=sys.stderr)
+    print(f"Info: AWS Region: {aws_context['region']}", file=sys.stderr)
     
-    # First, check if there's a custom mapping
-    if terraform_service in terraform_to_iam_mappings:
-        iam_service = terraform_to_iam_mappings[terraform_service]
-        return iam_service
-    
-    # If no custom mapping, use the Terraform service name as-is
-    # This respects Terraform's naming convention
-    iam_service = terraform_service
-    
-    # Validate against resources.json if available
-    if IAM_SERVICES:
-        if iam_service not in IAM_SERVICES:
-            # Try common transformations
-            alternatives = [
-                iam_service.replace('_', '-'),  # underscore to dash
-                iam_service.replace('-', '_'),  # dash to underscore
-            ]
-            for alt in alternatives:
-                if alt in IAM_SERVICES:
-                    return alt
-            
-            # If still not found, keep the Terraform name
-            # The API call will fail gracefully
-    
-    return iam_service
-
-
-def get_api_resource_name(resource_type: str, service: str) -> str:
-    """Map Terraform resource name to API resource name for special cases.
-    
-    Some resources have different names in the permissions API than in Terraform.
-    By default, keep the Terraform resource name unchanged.
-    """
-    # Special mappings where the API resource name differs from Terraform name
-    # Most resources use the exact Terraform name, only add exceptions here
-    special_mappings = {
-        'aws_cloudtrail': 'aws_cloudtrail_trail',
-        'aws_cognito_user_pool': 'aws_cognitoidp_user_pool',
-        'aws_cognito_user_pool_domain': 'aws_cognitoidp_user_pool_domain',
-        'aws_db_parameter_group': 'aws_rds_cluster_parameter_group',
-        'aws_db_subnet_group': 'aws_rds_subnet_group',
-        'aws_flow_log': 'aws_ec2_log_flow',
-        'aws_iam_openid_connect_provider': 'aws_iam_open_id_connect_provider',
-        'aws_lb': 'aws_elasticloadbalancing_load_balancer',
-        'aws_lb_listener': 'aws_elasticloadbalancing_listener',
-        'aws_lb_target_group': 'aws_elasticloadbalancing_target_group',
-    }
-    
-    # Check if this resource has a special mapping
-    if resource_type in special_mappings:
-        return special_mappings[resource_type]
-    
-    # Default: return the Terraform resource name unchanged
-    # The API should accept the Terraform resource name as-is
-    return resource_type
-    
-    return resource_type
-
-
-def to_camel_case(text: str) -> str:
-    """Convert text to CamelCase without spaces."""
-    # Remove 'aws_' prefix if present
-    if text.startswith('aws_'):
-        text = text[4:]
-    
-    # Split by underscore and capitalize each word
-    words = text.split('_')
-    return ''.join(word.capitalize() for word in words)
-
-
-def analyze_terraform_plan(plan_file: str = "plan.json") -> tuple[List[Dict[str, Any]], Dict[str, Any]]:
-    """Analyze terraform plan and extract metadata.
-    
-    Returns:
-        tuple: (list of resources, metadata dict with account/region/partition info)
-    """
-    with open(plan_file, 'r') as f:
-        plan = json.load(f)
-    
-    # Extract metadata
-    metadata = {
-        'account_id': None,
-        'region': None,
-        'partition': 'aws',  # default to 'aws'
-        'resource_names': defaultdict(set)  # Maps resource type to set of resource names
-    }
-    
-    # Extract region from variables
-    region = plan.get('variables', {}).get('region', {}).get('value')
-    if region:
-        metadata['region'] = region
-    
-    filtered_changes = []
-    for resource in plan.get('resource_changes', []):
-        actions = resource.get('change', {}).get('actions', [])
-
-        if "no-op" not in actions:
-            resource_type = resource.get('type')
-            resource_name = resource.get('name')
-            
-            # Try to extract account ID from ARNs in the resource
-            if not metadata['account_id']:
-                after_values = resource.get('change', {}).get('after', {})
-                if after_values:
-                    # Search for account ID in common fields
-                    for key, value in after_values.items():
-                        if isinstance(value, str) and 'arn:aws:' in value:
-                            # Extract account ID from ARN
-                            parts = value.split(':')
-                            if len(parts) >= 5 and parts[4].isdigit():
-                                metadata['account_id'] = parts[4]
-                                metadata['partition'] = parts[1]
-                                break
-            
-            # Store resource names for ARN construction
-            if resource_name:
-                metadata['resource_names'][resource_type].add(resource_name)
-            
-            filtered_changes.append({
-                'type': resource_type,
-                'actions': actions,
-                'name': resource_name,
-                'change': resource.get('change', {})
-            })
-    
-    grouped = defaultdict(list)
-    for change in filtered_changes:
-        resource_type = change['type']
-        grouped[resource_type].extend(change['actions'])
-    
-    result = []
-    for resource_type, actions in sorted(grouped.items()):
+    for change in resource_changes:
+        resource_type = change.get('type')
+        if not resource_type:
+            print("Warning: Resource missing 'type' field, skipping", file=sys.stderr)
+            continue
+        
+        # Detect data sources via 'mode' field
+        mode = change.get('mode', '')
+        is_datasource = (mode == 'data')
+        
+        actions = change.get('change', {}).get('actions', [])
+        if not actions:
+            print(f"Warning: No actions for resource '{resource_type}', skipping", file=sys.stderr)
+            continue
+        
         service = get_service_from_resource_type(resource_type)
+        if not service:
+            continue
         
-        result.append({
+        resources.append({
             'type': resource_type,
             'service': service,
-            'actions': sorted(set(actions))
+            'actions': actions,
+            'is_datasource': is_datasource,
+            'aws_context': aws_context
         })
     
-    return result, metadata
+    print(f"Info: Extracted {len(resources)} valid resources", file=sys.stderr)
+    return resources
 
 
-class PermissionEnricher:    
-    def __init__(self, base_url: str = "https://tfgrantless.skillsboost.cloud/assets"):
-        self.base_url = base_url
+class PermissionEnricher:
+    """Fetches and enriches permissions from TFGrantless API."""
     
-    def fetch_permissions(self, service: str, resource_type: str) -> Dict[str, Any]:
-        """Fetch permissions from API, converting resource type to match service if needed."""
-        # Skip non-AWS resources
-        if service in ['local', 'random', 'tls']:
-            return {}
-        
-        # Get the correct API resource name (handles special cases)
-        api_resource_type = get_api_resource_name(resource_type, service)
-        
-        # URL format: {base_url}/{service}/{resource_type}-permissions.json
-        url = f"{self.base_url}/{service}/{api_resource_type}-resource-permissions.json"
-        
-        try:
-            response = requests.get(url, timeout=10)
-            response.raise_for_status()
-            data = response.json()
-
-            if api_resource_type in data:
-                return data[api_resource_type]
-            else:
-                print(f"Warning: Resource type '{api_resource_type}' not found in API response for URL: {url}", file=sys.stderr)
-                return {}
-                
-        except json.JSONDecodeError as e:
-            # Silent fail for not found resources (empty response)
-            return {}
-        except requests.HTTPError as e:
-            if e.response.status_code == 404:
-                # Silent fail for 404 - resource not available in API
-                print(f"Warning: Permissions not found (404) for {api_resource_type} at URL: {url}")
-                return {}
-            else:
-                print(f"Warning: HTTP error {e.response.status_code} for {api_resource_type} at URL: {url}", file=sys.stderr)
-            return {}
-        except requests.RequestException as e:
-            print(f"Warning: Failed to fetch permissions for {api_resource_type} at URL: {url} - Error: {e}", file=sys.stderr)
-            return {}
+    def __init__(self):
+        self.base_url = "https://tfgrantless.skillsboost.cloud/assets"
+        self.session = requests.Session()
     
-    def filter_permissions_by_actions(self, permissions_data: Dict[str, Any], actions: List[str]) -> List[str]:
-        if not permissions_data:
+    def fetch_permissions(self, resource_type: str, is_datasource: bool = False) -> List[str]:
+        """Fetch permissions from API with fallback logic."""
+        # Special handling for resources with known issues
+        if resource_type == 'aws_sqs_queue_policy':
+            # API returns empty, use hardcoded permission
+            return ['sqs:SetQueueAttributes']
+        
+        if resource_type == 'aws_flow_log':
+            # API doesn't have data yet, use EC2 flow log permissions from SDK
+            return ['ec2:CreateFlowLogs', 'ec2:DeleteFlowLogs']
+        
+        api_resource_name = get_api_resource_name(resource_type)
+        
+        # Try datasource permissions first if it's a data source
+        if is_datasource:
+            permissions = self._fetch_with_fallback(api_resource_name, prefer_datasource=True)
+        else:
+            permissions = self._fetch_with_fallback(api_resource_name, prefer_datasource=False)
+        
+        # Return raw permissions - normalization happens later in main()
+        return permissions
+    
+    def _fetch_with_fallback(self, resource_name: str, prefer_datasource: bool) -> List[str]:
+        """Fetch with fallback between datasource and resource permissions."""
+        primary_suffix = '-datasource-permissions.json' if prefer_datasource else '-resource-permissions.json'
+        fallback_suffix = '-resource-permissions.json' if prefer_datasource else '-datasource-permissions.json'
+        
+        # Try primary
+        permissions = self._fetch_from_api(resource_name, primary_suffix)
+        if permissions:
+            return permissions
+        
+        # Try fallback
+        print(f"Info: Trying fallback for '{resource_name}'", file=sys.stderr)
+        permissions = self._fetch_from_api(resource_name, fallback_suffix)
+        if permissions:
+            return permissions
+        
+        print(f"Error: No permissions found for '{resource_name}'", file=sys.stderr)
+        return []
+    
+    def _fetch_from_api(self, resource_name: str, suffix: str) -> List[str]:
+        """Fetch permissions from API endpoint."""
+        # Extract service from resource name (e.g., aws_s3_bucket -> s3)
+        service = get_service_from_resource_type(resource_name)
+        if not service:
+            ERRORS.append({
+                'step': 'fetch_permissions',
+                'resource': resource_name,
+                'error': 'Failed to extract service from resource type'
+            })
             return []
         
-        required_permissions = []
-        
-        # Iterate through each action and collect permissions
-        for action in actions:
-            if action in permissions_data:
-                action_perms = permissions_data[action]
-                if isinstance(action_perms, list):
-                    required_permissions.extend(action_perms)
-                elif isinstance(action_perms, str):
-                    required_permissions.append(action_perms)
-        
-        # Return unique permissions
-        return sorted(set(required_permissions))
-    
-    def enrich_results(self, results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        enriched_results = []
-        
-        for item in results:
-            service = item.get('service')
-            resource_type = item.get('type')
-            actions = item.get('actions', [])
-            
-            permissions_data = self.fetch_permissions(service, resource_type)
-            permissions = self.filter_permissions_by_actions(permissions_data, actions)
-            
-            enriched_item = {
-                **item,
-                'permissions': permissions
-            }
-            
-            enriched_results.append(enriched_item)
-        
-        return enriched_results
-
-
-def fetch_resource_arn_for_permission(permission: str, iam_explorer_base_url: str = "https://iam-explorer.skillsboost.cloud/json") -> List[str]:
-    """Fetch resource ARNs for a single IAM permission from IAM Explorer API.
-    
-    Args:
-        permission: Single IAM permission (e.g., "cloudfront:CreateOriginAccessControl")
-        iam_explorer_base_url: Base URL for IAM Explorer API
-        
-    Returns:
-        List of resource ARN patterns for this permission
-    """
-    if ':' not in permission:
+        url = f"{self.base_url}/{service}/{resource_name}{suffix}"
+        try:
+            response = self.session.get(url, timeout=10)
+            if response.status_code == 200:
+                data = response.json()
+                
+                # The API returns nested structure:
+                # {"aws_s3_bucket": {"create": ["s3:CreateBucket", ...], "delete": [...], ...}}
+                resource_data = data.get(resource_name, {})
+                
+                # If it's a dict with action categories, flatten all permissions
+                if isinstance(resource_data, dict):
+                    all_permissions = []
+                    for action_category, perms in resource_data.items():
+                        if isinstance(perms, list):
+                            all_permissions.extend(perms)
+                    
+                    if all_permissions:
+                        print(f"Info: Fetched {len(all_permissions)} permissions from {suffix}", file=sys.stderr)
+                        return all_permissions
+                # Fallback: if it's already a list
+                elif isinstance(resource_data, list):
+                    print(f"Info: Fetched {len(resource_data)} permissions from {suffix}", file=sys.stderr)
+                    return resource_data
+                
+                error_msg = f"API returned empty permissions for '{resource_name}'"
+                print(f"Warning: {error_msg}", file=sys.stderr)
+                ERRORS.append({
+                    'step': 'fetch_permissions',
+                    'resource': resource_name,
+                    'url': url,
+                    'error': error_msg
+                })
+                return []
+            else:
+                error_msg = f"API returned status {response.status_code}"
+                print(f"Warning: {error_msg} for '{url}'", file=sys.stderr)
+                ERRORS.append({
+                    'step': 'fetch_permissions',
+                    'resource': resource_name,
+                    'url': url,
+                    'error': error_msg
+                })
+        except requests.RequestException as e:
+            error_msg = str(e)
+            print(f"Warning: API request failed for '{url}': {error_msg}", file=sys.stderr)
+            ERRORS.append({
+                'step': 'fetch_permissions',
+                'resource': resource_name,
+                'url': url,
+                'error': f"Request failed: {error_msg}"
+            })
         return []
+    
+    def filter_permissions_by_actions(self, permissions: List[str], actions: List[str]) -> List[str]:
+        """Filter permissions based on Terraform actions."""
+        if 'create' in actions or 'update' in actions:
+            return permissions
         
-    service, action = permission.split(':', 1)
-    url = f"{iam_explorer_base_url}/{service}/{action}.json"
+        # For read/no-op actions, filter to read-only permissions
+        read_prefixes = ['Get', 'List', 'Describe', 'Head']
+        filtered = [p for p in permissions if any(p.split(':')[1].startswith(prefix) for prefix in read_prefixes)]
+        
+        if not filtered:
+            print(f"Warning: No read permissions found, returning all permissions", file=sys.stderr)
+            return permissions
+        
+        return filtered
+
+
+def extract_arn_from_sdk_mapping(service: str, action: str) -> List[str]:
+    """Extract ARN patterns from map.json SDK mappings."""
+    if not SDK_PERMISSION_MAPPINGS:
+        return []
+    
+    # Try different SDK service name patterns
+    # cognito-idp -> CognitoIdentityProvider, CognitoIdp
+    patterns = [
+        service.upper(),
+        service.title(),
+        ''.join(w.capitalize() for w in service.split('-'))
+    ]
+    
+    # Special mappings for services with multiple name variations
+    if service == 'cognito-idp':
+        patterns.extend(['CognitoIdentityProvider', 'CognitoIdentityServiceProvider'])
+    
+    # Search for SDK methods that contain this action
+    for pattern in patterns:
+        for sdk_key, mappings in SDK_PERMISSION_MAPPINGS.items():
+            if not sdk_key.startswith(f"{pattern}."):
+                continue
+            
+            # Check if this SDK method has the action we're looking for
+            for mapping in mappings:
+                if mapping.get('action', '').lower() == f"{service}:{action}".lower():
+                    # Check if there's an ARN override
+                    arn_override = mapping.get('arn_override', {})
+                    if arn_override and 'template' in arn_override:
+                        print(f"Info: Found ARN from map.json for '{service}:{action}': {arn_override['template']}", file=sys.stderr)
+                        return [arn_override['template']]
+    
+    return []
+
+
+def fetch_resource_arn_for_permission(service: str, permission: str) -> List[str]:
+    """Fetch ARN patterns from IAM Explorer API. Returns list of ARN patterns."""
+    if ':' not in permission:
+        error_msg = f"Invalid permission format '{permission}', expected 'service:action'"
+        print(f"Warning: {error_msg}", file=sys.stderr)
+        ERRORS.append({
+            'step': 'fetch_arn',
+            'permission': permission,
+            'error': error_msg
+        })
+        return ['*']
+    
+    service_part, action = permission.split(':', 1)
+    
+    # Filter out unsupported services/actions
+    if action == 'Options':
+        print(f"Warning: Skipping invalid action '{action}' for service '{service_part}'", file=sys.stderr)
+        return ['*']
+    
+    # Skip s3express entirely - not supported in IAM Explorer
+    if service_part == 's3express':
+        print(f"Info: Skipping s3express permission '{permission}' - not supported", file=sys.stderr)
+        return ['*']
+    
+    # Override service for IAM-specific actions
+    # PassRole and CreateServiceLinkedRole belong to IAM service, not the calling service
+    if action in ['PassRole', 'CreateServiceLinkedRole']:
+        api_service = 'iam'
+    else:
+        # Map service names for IAM Explorer API
+        # application-autoscaling uses 'application-autoscaling' not 'appautoscaling'
+        iam_explorer_service_mappings = {
+            'elbv2': 'elasticloadbalancing',
+            'cognitoidp': 'cognito-idp',
+            'appautoscaling': 'application-autoscaling',
+        }
+        api_service = iam_explorer_service_mappings.get(service, service)
+    
+    # URL format: https://iam-explorer.skillsboost.cloud/json/{service}/{action}.json
+    url = f"https://iam-explorer.skillsboost.cloud/json/{api_service}/{action}.json"
     
     try:
         response = requests.get(url, timeout=10)
-        response.raise_for_status()
-        data = response.json()
         
-        # Extract resource ARNs
-        resource_arns = data.get('resource_arns', [])
-        return resource_arns if resource_arns else []
-            
-    except (requests.RequestException, json.JSONDecodeError):
-        return []
+        if response.status_code == 200 and response.text.strip():
+            data = response.json()
+            # API returns {"access_level": "...", "resource_arns": [...]}
+            resource_arns = data.get('resource_arns', [])
+            if resource_arns:
+                # Return all ARN patterns
+                return resource_arns
+            else:
+                ERRORS.append({
+                    'step': 'fetch_arn',
+                    'permission': permission,
+                    'url': url,
+                    'error': 'No resource_arns in response'
+                })
+        elif response.status_code == 404:
+            # 404 is common for permissions not in IAM Explorer, don't log as error
+            pass
+        else:
+            ERRORS.append({
+                'step': 'fetch_arn',
+                'permission': permission,
+                'url': url,
+                'error': f"HTTP {response.status_code}"
+            })
+    except (requests.RequestException, json.JSONDecodeError) as e:
+        ERRORS.append({
+            'step': 'fetch_arn',
+            'permission': permission,
+            'url': url,
+            'error': str(e)
+        })
+    
+    # Fallback: Try to extract ARN from map.json SDK mappings
+    arn_from_map = extract_arn_from_sdk_mapping(service_part, action)
+    if arn_from_map:
+        return arn_from_map
+    
+    return ['*']
 
 
-def generate_iam_policy(enriched_results: List[Dict[str, Any]], metadata: Dict[str, Any]) -> Dict[str, Any]:
-    """Generate IAM policy by grouping permissions by service and resource ARNs.
+def generate_iam_policy(enriched_resources: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Generate IAM policy from enriched resource permissions."""
+    # Get AWS context from first resource (all should have same context)
+    aws_context = enriched_resources[0].get('aws_context', {}) if enriched_resources else {}
     
-    Args:
-        enriched_results: List of enriched resource data
-        metadata: Dict containing account_id, region, partition, and resource_names
-    """
+    # Collect all unique permissions across all resources
+    all_permissions = set()
     
-    # Structure to hold permission mappings: {service: {resource_key: set(permissions)}}
-    permission_map = defaultdict(lambda: defaultdict(set))
-    
-    for item in enriched_results:
-        permissions = item.get('permissions', [])
-        
-        # Skip if no permissions
-        if not permissions:
-            continue
-        
-        # Process each permission individually
+    for resource in enriched_resources:
+        permissions = resource.get('permissions', [])
         for permission in permissions:
-            if ':' not in permission:
-                continue
-                
-            service = permission.split(':', 1)[0]
-            
-            # Fetch resource ARNs for this specific permission
-            resource_arns = fetch_resource_arn_for_permission(permission)
-            
-            if not resource_arns:
-                resource_arns = ["please_update_suitable_resources"]
-            
-            # Create a key from sorted resource ARNs for grouping
-            resource_key = tuple(sorted(resource_arns))
-            
-            # Group permissions by service and resource combination (using set to avoid duplicates)
-            permission_map[service][resource_key].add(permission)
+            if ':' in permission:
+                all_permissions.add(permission)
     
-    # Replace ARN placeholders with actual values from metadata
-    def replace_arn_placeholders(arn: str, metadata: Dict[str, Any]) -> str:
-        """Replace ${Partition}, ${Region}, ${Account} with actual values."""
-        if arn == "*":
-            return arn
-            
-        replacements = {
-            '${Partition}': metadata.get('partition', 'aws'),
-            '${Region}': metadata.get('region', 'REGION'),
-            '${Account}': metadata.get('account_id', 'ACCOUNT_ID'),
+    # Group permissions by their ARN patterns (deduplicate globally)
+    arn_to_permissions = defaultdict(set)
+    
+    for permission in all_permissions:
+        # Extract service from permission (e.g., 'logs:CreateLogDelivery' -> 'logs')
+        permission_service = permission.split(':', 1)[0]
+        
+        arns = fetch_resource_arn_for_permission(permission_service, permission)
+        
+        # Replace ARN placeholders with actual values from plan
+        processed_arns = []
+        for arn in arns:
+            arn = arn.replace('${Partition}', aws_context.get('partition', 'aws'))
+            arn = arn.replace('${Region}', aws_context.get('region', '*'))
+            # Keep ${Account} as placeholder - don't replace it
+            processed_arns.append(arn)
+        
+        # Group permissions by their ARN patterns (as a tuple for hashability)
+        arn_key = tuple(sorted(processed_arns))
+        arn_to_permissions[arn_key].add(permission)
+    
+    # Create statements grouped by ARN patterns
+    wildcard_statements = []
+    specific_statements = []
+    
+    for arn_tuple, perms in arn_to_permissions.items():
+        arns_list = list(arn_tuple)
+        resource_value = arns_list if arns_list != ['*'] else '*'
+        
+        statement = {
+            'Effect': 'Allow',
+            'Action': sorted(list(perms)),
+            'Resource': resource_value
         }
         
-        result = arn
-        for placeholder, value in replacements.items():
-            result = result.replace(placeholder, value)
-        
-        return result
+        # Separate wildcard and specific resource statements
+        if resource_value == '*':
+            wildcard_statements.append(statement)
+        else:
+            specific_statements.append(statement)
     
-    # Generate statements: wildcard resources first, then specific resources
-    statements_with_wildcard = []
-    statements_without_wildcard = []
+    # Combine with wildcard statements first
+    statements = wildcard_statements + specific_statements
     
-    for service in sorted(permission_map.keys()):
-        for resource_key, perms in sorted(permission_map[service].items()):
-            resource_list = [replace_arn_placeholders(arn, metadata) for arn in resource_key]
-            
-            # Check if wildcard is present
-            has_wildcard = "*" in resource_list
-            
-            if has_wildcard:
-                # Separate wildcard and specific ARNs
-                wildcard_arns = ["*"]
-                specific_arns = [arn for arn in resource_list if arn != "*"]
-                
-                # Create wildcard statement
-                wildcard_statement = {
-                    "Effect": "Allow",
-                    "Action": sorted(perms),
-                    "Resource": "*"
-                }
-                statements_with_wildcard.append(wildcard_statement)
-                
-                # Create specific ARN statement if there are any
-                if specific_arns:
-                    if len(specific_arns) == 1:
-                        resource_value = specific_arns[0]
-                    else:
-                        resource_value = specific_arns
-                    
-                    specific_statement = {
-                        "Effect": "Allow",
-                        "Action": sorted(perms),
-                        "Resource": resource_value
-                    }
-                    statements_without_wildcard.append(specific_statement)
-            else:
-                # No wildcard
-                if len(resource_list) == 1:
-                    resource_value = resource_list[0]
-                else:
-                    resource_value = resource_list
-                
-                statement = {
-                    "Effect": "Allow",
-                    "Action": sorted(perms),
-                    "Resource": resource_value
-                }
-                statements_without_wildcard.append(statement)
-    
-    # Combine statements with wildcards first, then specific resources
-    all_statements = statements_with_wildcard + statements_without_wildcard
-    
-    # Create IAM policy document
     policy = {
-        "Version": "2012-10-17",
-        "Statement": all_statements
+        'Version': '2012-10-17',
+        'Statement': statements
     }
     
+    print(f"Info: Generated IAM policy with {len(statements)} statements ({len(wildcard_statements)} wildcard, {len(specific_statements)} specific)", file=sys.stderr)
     return policy
 
 
-def write_output_file(data: List[Dict[str, Any]], output_file: str = "output.json") -> None:
-    with open(output_file, 'w') as f:
-        json.dump(data, f, indent=2)
-    print(f"Results written to {output_file}", file=sys.stderr)
-
-
-def write_iam_policy_file(policy: Dict[str, Any], iam_file: str = "iam.json") -> None:
-    """Write IAM policy document to file."""
-    with open(iam_file, 'w') as f:
-        json.dump(policy, f, indent=2)
-    print(f"IAM policy written to {iam_file}", file=sys.stderr)
+def write_iam_policy_file(policy: Dict[str, Any], output_file: str):
+    """Write IAM policy to file."""
+    try:
+        with open(output_file, 'w') as f:
+            json.dump(policy, f, indent=2)
+        print(f"Info: IAM policy written to '{output_file}'", file=sys.stderr)
+    except IOError as e:
+        print(f"Error: Failed to write '{output_file}': {e}", file=sys.stderr)
 
 
 def main():
     """Main entry point."""
+    plan_file = 'plan.json'
+    output_file = 'output.json'
+    iam_policy_file = 'iam.json'
+    
+    print("Step 1: Analyzing Terraform plan...", file=sys.stderr)
+    resources = analyze_terraform_plan(plan_file)
+    
+    if not resources:
+        print("Error: No resources to process", file=sys.stderr)
+        sys.exit(1)
+    
+    print("\nStep 2: Fetching permissions from TFGrantless API...", file=sys.stderr)
+    enricher = PermissionEnricher()
+    enriched_resources = []
+    
+    for resource in resources:
+        permissions = enricher.fetch_permissions(
+            resource['type'],
+            resource.get('is_datasource', False)
+        )
+        
+        filtered_permissions = enricher.filter_permissions_by_actions(
+            permissions,
+            resource['actions']
+        )
+        
+        # Normalize permissions using map.json AFTER fetching from API
+        normalized_permissions = [normalize_iam_permission(p) for p in filtered_permissions]
+        
+        # Expand permissions to include all related IAM actions from map.json
+        # Example: KMS.CreateKey requires both kms:CreateKey and kms:TagResource
+        expanded_permissions = expand_permissions_from_map(normalized_permissions)
+        
+        enriched_resource = resource.copy()
+        enriched_resource['permissions'] = expanded_permissions
+        enriched_resources.append(enriched_resource)
+    
+    # Write intermediate output
     try:
-        plan_file = sys.argv[1] if len(sys.argv) > 1 else "plan.json"
-        output_file = sys.argv[2] if len(sys.argv) > 2 else "output.json"
-        iam_file = sys.argv[3] if len(sys.argv) > 3 else "iam.json"
-        
-        # Analyze terraform plan and extract metadata
-        result, metadata = analyze_terraform_plan(plan_file)
-        
-        # Print extracted metadata
-        print(f"Extracted metadata:", file=sys.stderr)
-        print(f"  Region: {metadata.get('region', 'N/A')}", file=sys.stderr)
-        print(f"  Account ID: {metadata.get('account_id', 'N/A')}", file=sys.stderr)
-        print(f"  Partition: {metadata.get('partition', 'aws')}", file=sys.stderr)
-        
-        # Enrich with permissions
-        enricher = PermissionEnricher()
-        enriched_result = enricher.enrich_results(result)
-        
-        # Write output file
-        write_output_file(enriched_result, output_file)
-        
-        # Generate and write IAM policy with metadata
-        iam_policy = generate_iam_policy(enriched_result, metadata)
-        write_iam_policy_file(iam_policy, iam_file)
-
-        if not enriched_result:
-            sys.exit(1)
-            
-    except FileNotFoundError:
-        print(f"Error: plan.json not found", file=sys.stderr)
+        with open(output_file, 'w') as f:
+            json.dump(enriched_resources, f, indent=2)
+        print(f"\nStep 3: Enriched permissions written to '{output_file}'", file=sys.stderr)
+    except IOError as e:
+        print(f"Error: Failed to write '{output_file}': {e}", file=sys.stderr)
         sys.exit(1)
-    except json.JSONDecodeError as e:
-        print(f"Error: Invalid JSON in plan file: {e}", file=sys.stderr)
-        sys.exit(1)
-    except Exception as e:
-        print(f"Error: {e}", file=sys.stderr)
-        sys.exit(1)
+    
+    print("\nStep 4: Generating IAM policy...", file=sys.stderr)
+    iam_policy = generate_iam_policy(enriched_resources)
+    
+    print("\nStep 5: Writing IAM policy...", file=sys.stderr)
+    write_iam_policy_file(iam_policy, iam_policy_file)
+    
+    print(f"\n✓ Complete! IAM policy generated at '{iam_policy_file}'", file=sys.stderr)
+    
+    # Write errors to error.json
+    error_file = 'error.json'
+    if ERRORS:
+        try:
+            with open(error_file, 'w') as f:
+                json.dump({
+                    'total_errors': len(ERRORS),
+                    'errors': ERRORS
+                }, f, indent=2)
+            print(f"⚠ {len(ERRORS)} errors logged to '{error_file}'", file=sys.stderr)
+        except IOError as e:
+            print(f"Error: Failed to write '{error_file}': {e}", file=sys.stderr)
+    else:
+        print("✓ No errors encountered", file=sys.stderr)
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
