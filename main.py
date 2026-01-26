@@ -101,6 +101,110 @@ TERRAFORM_TO_API_RESOURCE_NAME_MAPPINGS = {
     'aws_lb_target_group': 'aws_lb_target_group',  # Fixed: elbv2 service uses aws_lb_target_group
 }
 
+# Service-specific tagging permission mappings
+# Maps IAM service name to its tagging permissions
+SERVICE_TAGGING_PERMISSIONS = {
+    'ec2': ['ec2:CreateTags', 'ec2:DeleteTags'],
+    'batch': ['batch:TagResource', 'batch:UntagResource'],
+    'rds': ['rds:AddTagsToResource', 'rds:RemoveTagsFromResource'],
+    'kms': ['kms:TagResource', 'kms:UntagResource'],
+    'ecs': ['ecs:TagResource', 'ecs:UntagResource'],
+    'ecr': ['ecr:TagResource', 'ecr:UntagResource'],
+    'elasticloadbalancing': ['elasticloadbalancing:AddTags', 'elasticloadbalancing:RemoveTags'],
+    'elbv2': ['elasticloadbalancing:AddTags', 'elasticloadbalancing:RemoveTags'],
+    's3': ['s3:PutBucketTagging', 's3:DeleteBucketTagging'],
+    'cloudfront': ['cloudfront:TagResource', 'cloudfront:UntagResource'],
+    'iam': ['iam:TagRole', 'iam:UntagRole', 'iam:TagPolicy', 'iam:UntagPolicy', 'iam:TagInstanceProfile', 'iam:UntagInstanceProfile'],
+    'lambda': ['lambda:TagResource', 'lambda:UntagResource'],
+    'sqs': ['sqs:TagQueue', 'sqs:UntagQueue'],
+    'sns': ['sns:TagResource', 'sns:UntagResource'],
+    'logs': ['logs:TagLogGroup', 'logs:UntagLogGroup'],
+    'dynamodb': ['dynamodb:TagResource', 'dynamodb:UntagResource'],
+    'cognito-idp': ['cognito-idp:TagResource', 'cognito-idp:UntagResource'],
+    'cognitoidp': ['cognito-idp:TagResource', 'cognito-idp:UntagResource'],
+    'secretsmanager': ['secretsmanager:TagResource', 'secretsmanager:UntagResource'],
+    'ssm': ['ssm:AddTagsToResource', 'ssm:RemoveTagsFromResource'],
+    'events': ['events:TagResource', 'events:UntagResource'],
+    'scheduler': ['scheduler:TagResource', 'scheduler:UntagResource'],
+    'pipes': ['pipes:TagResource', 'pipes:UntagResource'],
+    'wafv2': ['wafv2:TagResource', 'wafv2:UntagResource'],
+    'cloudwatch': ['logs:TagLogGroup', 'logs:UntagLogGroup'],
+    'autoscaling': ['autoscaling:CreateOrUpdateTags', 'autoscaling:DeleteTags'],
+    'application-autoscaling': ['application-autoscaling:TagResource', 'application-autoscaling:UntagResource'],
+    'appautoscaling': ['application-autoscaling:TagResource', 'application-autoscaling:UntagResource'],
+}
+
+# Supplemental permissions that are commonly required but not always returned by APIs
+# These are permissions that resources typically need for full functionality
+SUPPLEMENTAL_PERMISSIONS = {
+    'logs': [
+        'logs:CreateLogStream',  # Required to write to log groups
+        'logs:PutLogEvents',  # Required to write log events
+        'logs:PutResourcePolicy',  # For cross-account/service access
+        'logs:DescribeResourcePolicies',
+        'logs:DeleteResourcePolicy',
+        'logs:GetLogDelivery',  # For log delivery configuration
+        'logs:ListLogDeliveries',
+        'logs:UpdateLogDelivery',
+        'logs:DeleteLogDelivery',
+        'logs:ListTagsForResource',  # For listing tags
+    ],
+    'kms': [
+        'kms:CreateGrant',  # Required for cross-service encryption (RDS, EBS, etc.)
+        'kms:Decrypt',  # Common encryption operation
+        'kms:Encrypt',  # Common encryption operation
+        'kms:GenerateDataKey',  # For envelope encryption
+        'kms:ReEncrypt',  # For key rotation
+    ],
+    'ec2': [
+        'ec2:GetManagedPrefixListEntries',  # For VPC/security groups with prefix lists
+        'ec2:DescribeAvailabilityZones',  # Common VPC requirement
+        'ec2:DescribeAccountAttributes',  # For account limits
+    ],
+    'cloudfront': [
+        'cloudfront:ListResponseHeadersPolicies',  # For distribution configuration
+        'cloudfront:GetResponseHeadersPolicy',
+        'cloudfront:ListOriginRequestPolicies',
+        'cloudfront:GetOriginRequestPolicy',
+        'cloudfront:ListCachePolicies',
+        'cloudfront:GetCachePolicy',
+        'cloudfront:ListTagsForResource',
+    ],
+    'rds': [
+        'rds:CreateDBClusterSnapshot',  # Common for backup/restore
+        'rds:CreateDBParameterGroup',  # For parameter management
+        'rds:ModifyDBParameterGroup',
+        'rds:DescribeGlobalClusters',  # For global database clusters
+        'rds:ListTagsForResource',
+    ],
+    'ssm': [
+        'ssm:GetParameters',  # Plural version for batch operations
+        'ssm:ListTagsForResource',
+    ],
+    'ecr': [
+        'ecr:ListTagsForResource',
+        'ecr:GetAuthorizationToken',  # Required to pull/push images
+    ],
+    'ecs': [
+        'ecs:ListTagsForResource',
+    ],
+    'scheduler': [
+        'scheduler:ListTagsForResource',
+    ],
+    'sqs': [
+        'sqs:ListQueueTags',  # SQS uses different naming for tag listing
+    ],
+    'pipes': [
+        'pipes:ListTagsForResource',
+    ],
+    'wafv2': [
+        'wafv2:ListTagsForResource',
+    ],
+    'application-autoscaling': [
+        'application-autoscaling:ListTagsForResource',
+    ],
+}
+
 # ============================================================================
 # END OF MAPPING TABLES
 # ============================================================================
@@ -163,11 +267,20 @@ def expand_permissions_from_map(permissions: List[str]) -> List[str]:
         # Convert IAM permission to SDK method format
         # kms:CreateKey -> KMS.CreateKey
         # s3:GetObject -> S3.GetObject
+        # elasticloadbalancing:CreateListener -> ElasticLoadBalancingV2.CreateListener
         sdk_service_patterns = [
             service_prefix.upper(),  # kms -> KMS
             service_prefix.title(),  # s3 -> S3
             ''.join(w.capitalize() for w in service_prefix.split('-'))  # cognito-identity -> CognitoIdentity
         ]
+        
+        # Special case for elasticloadbalancing -> try ElasticLoadBalancingV2
+        if service_prefix == 'elasticloadbalancing':
+            sdk_service_patterns.insert(0, 'ElasticLoadBalancingV2')  # Try V2 first
+        
+        # Special case for application-autoscaling -> ApplicationAutoScaling
+        if service_prefix == 'application-autoscaling':
+            sdk_service_patterns.insert(0, 'ApplicationAutoScaling')
         
         found_mapping = False
         for pattern in sdk_service_patterns:
@@ -193,6 +306,54 @@ def expand_permissions_from_map(permissions: List[str]) -> List[str]:
             seen.add(permission)
     
     return expanded
+
+
+def add_tagging_permissions_if_needed(permissions: List[str], service: str, has_tags: bool) -> List[str]:
+    """Add service-specific tagging permissions if resource has tags_all."""
+    if not has_tags:
+        return permissions
+    
+    # Get tagging permissions for this service
+    tag_permissions = SERVICE_TAGGING_PERMISSIONS.get(service, [])
+    
+    if not tag_permissions:
+        # If no specific mapping, skip (don't warn for every resource)
+        return permissions
+    
+    # Add tagging permissions if not already present
+    result = list(permissions)
+    added = []
+    for tag_perm in tag_permissions:
+        if tag_perm not in result:
+            result.append(tag_perm)
+            added.append(tag_perm)
+    
+    if added:
+        print(f"Info: Added tagging permissions for service '{service}': {', '.join(added)}", file=sys.stderr)
+    
+    return result
+
+
+def add_supplemental_permissions(permissions: List[str], service: str) -> List[str]:
+    """Add commonly required supplemental permissions for a service."""
+    # Get supplemental permissions for this service
+    supplemental = SUPPLEMENTAL_PERMISSIONS.get(service, [])
+    
+    if not supplemental:
+        return permissions
+    
+    # Add supplemental permissions if not already present
+    result = list(permissions)
+    added = []
+    for supp_perm in supplemental:
+        if supp_perm not in result:
+            result.append(supp_perm)
+            added.append(supp_perm)
+    
+    if added:
+        print(f"Info: Added supplemental permissions for service '{service}': {', '.join(added)}", file=sys.stderr)
+    
+    return result
 
 
 def get_service_from_resource_type(resource_type: str) -> str:
@@ -272,12 +433,20 @@ def analyze_terraform_plan(plan_file: str) -> List[Dict[str, Any]]:
         if not service:
             continue
         
+        # Check if resource has tags_all (indicates tagging is used)
+        has_tags = False
+        if 'change' in change and 'after' in change['change']:
+            has_tags = 'tags_all' in change['change']['after'] and change['change']['after']['tags_all']
+        elif 'values' in change:
+            has_tags = 'tags_all' in change['values'] and change['values']['tags_all']
+        
         resources.append({
             'type': resource_type,
             'service': service,
             'actions': actions,
             'is_datasource': is_datasource,
-            'aws_context': aws_context
+            'aws_context': aws_context,
+            'has_tags': has_tags
         })
     
     print(f"Info: Extracted {len(resources)} valid resources", file=sys.stderr)
@@ -645,8 +814,21 @@ def main():
         # Example: KMS.CreateKey requires both kms:CreateKey and kms:TagResource
         expanded_permissions = expand_permissions_from_map(normalized_permissions)
         
+        # Add tagging permissions if resource has tags_all
+        tagged_permissions = add_tagging_permissions_if_needed(
+            expanded_permissions,
+            resource['service'],
+            resource.get('has_tags', False)
+        )
+        
+        # Add commonly required supplemental permissions
+        final_permissions = add_supplemental_permissions(
+            tagged_permissions,
+            resource['service']
+        )
+        
         enriched_resource = resource.copy()
-        enriched_resource['permissions'] = expanded_permissions
+        enriched_resource['permissions'] = final_permissions
         enriched_resources.append(enriched_resource)
     
     # Write intermediate output
